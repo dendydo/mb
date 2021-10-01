@@ -1,0 +1,81 @@
+----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  creationTimestamp: null
+  labels:
+    app: mindbox
+  name: mindbox
+  namespace: mindbox
+spec:
+  # три зоны - три изначальные реплики
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mindbox
+  strategy:
+    # минимально у нас 3 реплики (=хотим максимально отказоустойчивый deployment), максимально 4 (=4 пода справляются с пиковой нагрузкой). 
+    # на тот случай, если кто-то будет катить деплой в пиковую нагрузку, делаем maxUnavailable: 0 - число подов в моменте будет до 5, но не зааффектит пользователей. 
+    # с другой стороны можно и maxUnavailable: 1 поставить, а maxSurge: 0. вопрос в том, что оценивается серьезнее: вероятность падения двух зон в течение 15 секунд или запуск лишнего пода на 15 секунд три-четыре раза подряд.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: mindbox
+    spec:
+      affinity:
+        podAntiAffinity:
+          # максимум 4 пода, нод - 5. ставим требования не размещать поды на одной ноде
+          requiredDuringSchedulingIgnoredDuringExecution:
+            matchLabels:
+              app: mindbox
+            topologyKey: "kubernetes.io/hostname"
+          # так или иначе в одной из зон будет больше одного пода (4>3). ставим так, чтобы было не больше двух
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              matchLabels:
+                app: mindbox
+              topologyKey: "kubernetes.io/zone"
+      containers:
+      - image: nginx
+        name: nginx
+        ports:
+          - containerPort: 80
+        # даем приложению время на запуск (=приложение требует около 5-10 секунд для инициализации)
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 80
+          periodSeconds: 3
+          failureThreshold: 5
+        # "на первые запросы приложению требуется значительно больше ресурсов CPU" - вопрос - почему? скорее всего кэш, установка коннектов с БД или что-то подобное. В скрипт /app/application_lifecycle.sh помещаем код с curl который циклом запрашивает ключевые страницы и прогревает кэш. postStart здесь нужен для того, чтобы кэш прогрелся до попадания в балансировку - иначе удовольствие прогревать его достанется пользователям, будут всплески времени отклика, вылеты таймаутов и пятисоток от ингресов, повисшие коннекты к бд и т.д.
+        lifecycle:
+          postStart:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15; /app/cache_warm_up.sh"]
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          # даем больше чем нужно: для старта (="на первые запросы приложению требуется значительно больше ресурсов CPU"). учитывая то, что у нас есть postStart, можно поставить limits==requests, в таком случае будем дольше стартовать.
+          limits:
+            cpu: 3000m
+            memory: 128Mi
+----
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  creationTimestamp: null
+  name: mindbox
+spec:
+  maxReplicas: 4
+  minReplicas: 3
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mindbox
+  targetCPUUtilizationPercentage: 70
